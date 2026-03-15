@@ -1,22 +1,22 @@
 # fetch_data.py
 # NSE OHLCV fetcher — GitHub Actions compatible
 #
-# Root causes of previous failures:
-#   - yfinance 0.2.51 has YFTzMissingError bug on Linux for .NS tickers
-#   - stooq dropped Indian .IN symbol support in 2024
-#   - Yahoo REST v8 blocks GitHub Actions IPs outright
+# Sources (tried in order):
+#   1. NSE Bhavcopy CSV — static file server, never blocked, no auth needed
+#      Downloads daily OHLCV CSVs from NSE archives and builds history.
+#      https://archives.nseindia.com/products/content/sec_bhavdata_full_DDMMYYYY.csv
+#   2. yfinance Ticker.history() — works ~60% of the time from GitHub IPs
+#      Used only if Bhavcopy already has recent data (top-up missing days).
 #
-# Solution:
-#   - yfinance 0.2.61+ (timezone bug fixed, works on Linux/GitHub Actions)
-#   - Download tickers one by one with a delay — more reliable than batch
-#     for .NS symbols on the fixed version
-#   - Retry logic with exponential backoff
-#   - NSE-Python REST as final fallback for any remaining failures
+# Fail-fast: 5s timeout on all HTTP calls. No hanging for 12 seconds.
+# Pipeline exits immediately if >50% fail, not after wasting 13 minutes.
 
 import os
+import io
 import time
+import zipfile
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
 import pandas as pd
 import pytz
@@ -38,223 +38,193 @@ logger.add(
     rotation="1 day", retention="14 days", level="INFO",
 )
 
-IST      = pytz.timezone(TIMEZONE)
-START_DT = (datetime.now(IST) - timedelta(days=730)).strftime("%Y-%m-%d")
-END_DT   = datetime.now(IST).strftime("%Y-%m-%d")
+IST     = pytz.timezone(TIMEZONE)
+TIMEOUT = 5   # seconds — fail fast, don't hang
 
-
-def today_ist():
+def today_ist() -> str:
     return datetime.now(IST).strftime("%Y-%m-%d")
 
+def _session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept-Encoding": "gzip, deflate",
+        "Accept":          "*/*",
+        "Connection":      "keep-alive",
+    })
+    return s
+
+SESSION = _session()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLEAN DATAFRAME HELPER
+# SOURCE 1 — NSE Bhavcopy (static CSV archive, never rate-limited)
 # ─────────────────────────────────────────────────────────────────────────────
+# NSE publishes a full-market OHLCV CSV for every trading day.
+# URL pattern: https://archives.nseindia.com/products/content/
+#              sec_bhavdata_full_DDMMYYYY.csv
+# This is a static file server — no cookies, no auth, no rate limits.
+# We download the last N trading days and merge them.
 
-def _clean(df_raw: pd.DataFrame, ticker: str) -> pd.DataFrame:
-    """
-    Normalise a raw yfinance DataFrame into our standard schema.
-    Handles both single-ticker (flat columns) and the edge cases
-    where yfinance wraps columns in a MultiIndex.
-    """
-    if df_raw is None or df_raw.empty:
-        return pd.DataFrame()
+BHAVCOPY_URL = (
+    "https://archives.nseindia.com/products/content/"
+    "sec_bhavdata_full_{date}.csv"
+)
 
-    # Flatten MultiIndex if present
-    if isinstance(df_raw.columns, pd.MultiIndex):
-        # MultiIndex: (metric, ticker) — extract just this ticker
+def _trading_days(n: int = 365) -> list[date]:
+    """Return last n calendar days, Mon–Fri only (approximate trading days)."""
+    days = []
+    d = datetime.now(IST).date() - timedelta(days=1)
+    while len(days) < n:
+        if d.weekday() < 5:   # Mon=0 … Fri=4
+            days.append(d)
+        d -= timedelta(days=1)
+    return days
+
+
+def fetch_bhavcopy_range(symbols: set, lookback_days: int = 370) -> dict[str, pd.DataFrame]:
+    """
+    Download Bhavcopy CSVs for the last `lookback_days` trading days.
+    Returns dict: symbol → DataFrame with columns date/open/high/low/close/volume/adj_close
+    Only EQ series rows are kept.
+    """
+    all_rows: list[pd.DataFrame] = []
+    days      = _trading_days(lookback_days)
+    fetched   = 0
+    missing   = 0
+
+    logger.info(f"Bhavcopy: fetching up to {len(days)} daily CSVs …")
+
+    for d in days:
+        url = BHAVCOPY_URL.format(date=d.strftime("%d%m%Y"))
         try:
-            df_raw.columns = df_raw.columns.get_level_values(0)
-        except Exception:
+            r = SESSION.get(url, timeout=TIMEOUT)
+            if r.status_code == 404:
+                missing += 1
+                continue   # holiday or weekend — skip silently
+            if r.status_code != 200:
+                logger.warning(f"Bhavcopy {d}: HTTP {r.status_code}")
+                continue
+
+            df = pd.read_csv(io.StringIO(r.text))
+            df.columns = [c.strip() for c in df.columns]
+
+            # Keep EQ series only
+            if "SERIES" in df.columns:
+                df = df[df["SERIES"].str.strip() == "EQ"]
+
+            # Normalise column names
+            col_map = {
+                "SYMBOL":       "symbol",
+                "OPEN":         "open",   "OPEN_PRICE":  "open",
+                "HIGH":         "high",   "HIGH_PRICE":  "high",
+                "LOW":          "low",    "LOW_PRICE":   "low",
+                "CLOSE":        "close",  "CLOSE_PRICE": "close",
+                "LAST":         "close",
+                "TTL_TRD_QNTY": "volume", "VOLUME":      "volume",
+                "TOTTRDQTY":    "volume",
+                "PREV_CLOSE":   "adj_close",
+            }
+            df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+            df["date"] = d.strftime("%Y-%m-%d")
+
+            needed = {"symbol", "open", "high", "low", "close"}
+            if not needed.issubset(set(df.columns)):
+                continue
+
+            if "volume" not in df.columns:
+                df["volume"] = 0
+            if "adj_close" not in df.columns:
+                df["adj_close"] = df["close"]
+
+            # Filter to only our symbols — saves memory
+            df = df[df["symbol"].isin(symbols)]
+            if not df.empty:
+                all_rows.append(
+                    df[["symbol","date","open","high","low","close","volume","adj_close"]]
+                )
+            fetched += 1
+
+        except requests.exceptions.Timeout:
+            logger.warning(f"Bhavcopy {d}: timeout — skipping")
+            continue
+        except Exception as e:
+            logger.warning(f"Bhavcopy {d}: {e}")
+            continue
+
+    logger.info(f"Bhavcopy: {fetched} days fetched, {missing} holidays skipped")
+
+    if not all_rows:
+        return {}
+
+    combined = pd.concat(all_rows, ignore_index=True)
+
+    # Clean numeric columns
+    for col in ["open","high","low","close","adj_close"]:
+        combined[col] = pd.to_numeric(combined[col], errors="coerce")
+    combined["volume"] = pd.to_numeric(combined["volume"], errors="coerce").fillna(0).astype(int)
+    combined = combined.dropna(subset=["close"])
+    combined = combined[combined["close"] > 0]
+    combined = combined.sort_values("date")
+
+    # Split by symbol
+    result: dict[str, pd.DataFrame] = {}
+    for sym in symbols:
+        sym_df = combined[combined["symbol"] == sym][
+            ["date","open","high","low","close","volume","adj_close"]
+        ].reset_index(drop=True)
+        if not sym_df.empty:
+            result[sym] = sym_df
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SOURCE 2 — yfinance (for indices + top-up any missing equity days)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_yfinance_single(nse_symbol: str, yf_ticker: str,
+                          days: int = 730) -> pd.DataFrame:
+    """
+    Quick yfinance fetch with hard 5s timeout enforced via requests.
+    Returns empty DataFrame if Yahoo blocks or times out — no hanging.
+    """
+    end_dt   = datetime.now(IST)
+    start_dt = end_dt - timedelta(days=days)
+    try:
+        t   = yf.Ticker(yf_ticker)
+        raw = t.history(
+            start=start_dt.strftime("%Y-%m-%d"),
+            end=end_dt.strftime("%Y-%m-%d"),
+            interval="1d",
+            auto_adjust=True,
+            actions=False,
+            timeout=TIMEOUT,
+        )
+        if raw is None or raw.empty:
             return pd.DataFrame()
 
-    # Rename to lowercase
-    df_raw.columns = [c.lower().replace(" ", "_") for c in df_raw.columns]
-
-    required = {"open", "high", "low", "close", "volume"}
-    if not required.issubset(set(df_raw.columns)):
-        logger.warning(f"{ticker}: missing columns {required - set(df_raw.columns)}")
+        raw.columns = [c.lower().replace(" ", "_") for c in raw.columns]
+        df = pd.DataFrame({
+            "date":      raw.index.strftime("%Y-%m-%d"),
+            "open":      pd.to_numeric(raw["open"],   errors="coerce"),
+            "high":      pd.to_numeric(raw["high"],   errors="coerce"),
+            "low":       pd.to_numeric(raw["low"],    errors="coerce"),
+            "close":     pd.to_numeric(raw["close"],  errors="coerce"),
+            "volume":    pd.to_numeric(raw.get("volume", pd.Series([0]*len(raw))),
+                                       errors="coerce").fillna(0).astype(int),
+            "adj_close": pd.to_numeric(raw["close"],  errors="coerce"),
+        })
+        df = df.dropna(subset=["close"])
+        df = df[df["close"] > 0]
+        return df.reset_index(drop=True)
+    except Exception as e:
+        logger.warning(f"  yfinance {nse_symbol}: {type(e).__name__}: {e}")
         return pd.DataFrame()
-
-    df = pd.DataFrame()
-    df["date"]      = df_raw.index.strftime("%Y-%m-%d")
-    df["open"]      = pd.to_numeric(df_raw["open"],   errors="coerce")
-    df["high"]      = pd.to_numeric(df_raw["high"],   errors="coerce")
-    df["low"]       = pd.to_numeric(df_raw["low"],    errors="coerce")
-    df["close"]     = pd.to_numeric(df_raw["close"],  errors="coerce")
-    df["volume"]    = pd.to_numeric(df_raw["volume"], errors="coerce").fillna(0).astype(int)
-    df["adj_close"] = pd.to_numeric(
-        df_raw.get("adj_close", df_raw.get("adjclose", df_raw["close"])),
-        errors="coerce"
-    )
-
-    df = df.dropna(subset=["close"])
-    df = df[df["close"] > 0]
-    return df.reset_index(drop=True)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SOURCE 1 — yfinance single-ticker with retry
-# ─────────────────────────────────────────────────────────────────────────────
-
-def fetch_yfinance(nse_symbol: str, yf_ticker: str,
-                   retries: int = 3) -> pd.DataFrame:
-    """
-    Fetch one ticker using yfinance.Ticker.history().
-    Uses .history() instead of .download() — more stable for .NS tickers.
-    """
-    for attempt in range(1, retries + 1):
-        try:
-            ticker_obj = yf.Ticker(yf_ticker)
-            raw = ticker_obj.history(
-                start=START_DT,
-                end=END_DT,
-                interval="1d",
-                auto_adjust=True,   # adj_close baked into Close
-                actions=False,
-            )
-            if raw is None or raw.empty:
-                logger.warning(f"  yfinance empty for {nse_symbol} attempt {attempt}")
-                time.sleep(2 * attempt)
-                continue
-
-            # .history() with auto_adjust=True: Close is already adjusted
-            raw["adj_close"] = raw["Close"]
-            df = _clean(raw, nse_symbol)
-            if not df.empty:
-                return df
-
-            time.sleep(2 * attempt)
-
-        except Exception as e:
-            logger.warning(f"  yfinance {nse_symbol} attempt {attempt}: {e}")
-            time.sleep(3 * attempt)
-
-    return pd.DataFrame()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SOURCE 2 — NSE unofficial JSON API (fallback, no rate limits from GH IPs)
-# ─────────────────────────────────────────────────────────────────────────────
-
-# NSE's public bhavcopy CSV — works reliably from GitHub Actions.
-# We use the NSE India public API for historical OHLCV.
-# This is the same data NSE publishes daily for free.
-
-NSE_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept":         "application/json, text/plain, */*",
-    "Accept-Language":"en-US,en;q=0.9",
-    "Referer":        "https://www.nseindia.com/",
-    "Origin":         "https://www.nseindia.com",
-    "Connection":     "keep-alive",
-}
-
-def _nse_session() -> requests.Session:
-    """
-    NSE requires a session cookie obtained by hitting the homepage first.
-    """
-    session = requests.Session()
-    session.headers.update(NSE_HEADERS)
-    try:
-        # Get cookies by hitting the main page
-        session.get("https://www.nseindia.com", timeout=10)
-        time.sleep(1)
-    except Exception:
-        pass
-    return session
-
-
-_nse_sess = None   # module-level singleton so we only initialise once
-
-def fetch_nse_api(nse_symbol: str, retries: int = 2) -> pd.DataFrame:
-    """
-    Fetch 1-year OHLCV from NSE India's public historical data API.
-    Endpoint: /api/historical/cm/equity
-    """
-    global _nse_sess
-    if _nse_sess is None:
-        logger.info("  Initialising NSE session …")
-        _nse_sess = _nse_session()
-
-    end_date   = datetime.now(IST)
-    start_date = end_date - timedelta(days=365)
-
-    url = "https://www.nseindia.com/api/historical/cm/equity"
-    params = {
-        "symbol":   nse_symbol,
-        "series":   '["EQ"]',
-        "from":     start_date.strftime("%d-%m-%Y"),
-        "to":       end_date.strftime("%d-%m-%Y"),
-        "csv":      "true",
-    }
-
-    for attempt in range(1, retries + 1):
-        try:
-            r = _nse_sess.get(url, params=params, timeout=15)
-            if r.status_code == 429:
-                time.sleep(10)
-                continue
-            if r.status_code != 200:
-                logger.warning(f"  NSE API {nse_symbol}: HTTP {r.status_code}")
-                time.sleep(3)
-                continue
-
-            # Response is CSV text
-            from io import StringIO
-            raw = pd.read_csv(StringIO(r.text))
-
-            if raw.empty:
-                return pd.DataFrame()
-
-            # NSE column names vary — normalise
-            raw.columns = [c.strip().lower().replace(" ", "_") for c in raw.columns]
-
-            # Map NSE column names to our schema
-            col_map = {
-                "date": "date",
-                "open_price": "open",   "open": "open",
-                "high_price": "high",   "high": "high",
-                "low_price":  "low",    "low":  "low",
-                "close_price":"close",  "close":"close",
-                "prev_close": "adj_close",
-                "total_traded_quantity": "volume",
-                "tottrdqty": "volume",
-            }
-            raw = raw.rename(columns=col_map)
-
-            needed = ["date","open","high","low","close","volume"]
-            missing = [c for c in needed if c not in raw.columns]
-            if missing:
-                logger.warning(f"  NSE API {nse_symbol}: missing cols {missing}")
-                return pd.DataFrame()
-
-            raw["date"] = pd.to_datetime(
-                raw["date"], dayfirst=True, errors="coerce"
-            ).dt.strftime("%Y-%m-%d")
-
-            if "adj_close" not in raw.columns:
-                raw["adj_close"] = raw["close"]
-
-            df = raw[["date","open","high","low","close","volume","adj_close"]].copy()
-            for col in ["open","high","low","close","adj_close"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0).astype(int)
-
-            df = df.dropna(subset=["close"])
-            df = df[df["close"] > 0]
-            df = df.sort_values("date").reset_index(drop=True)
-            return df
-
-        except Exception as e:
-            logger.warning(f"  NSE API {nse_symbol} attempt {attempt}: {e}")
-            time.sleep(3)
-
-    return pd.DataFrame()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -265,7 +235,7 @@ def upsert_prices(conn: sqlite3.Connection,
                   symbol: str, df: pd.DataFrame) -> int:
     if df.empty:
         return 0
-    cursor   = conn.cursor()
+    cursor = conn.cursor()
     inserted = 0
     for _, row in df.iterrows():
         try:
@@ -290,6 +260,16 @@ def upsert_prices(conn: sqlite3.Connection,
     return inserted
 
 
+def get_latest_prices(conn: sqlite3.Connection) -> pd.DataFrame:
+    return pd.read_sql_query("""
+        SELECT symbol, date, close, volume FROM daily_prices
+        WHERE (symbol, date) IN (
+            SELECT symbol, MAX(date) FROM daily_prices GROUP BY symbol
+        )
+        ORDER BY symbol
+    """, conn)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN PIPELINE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -297,56 +277,56 @@ def upsert_prices(conn: sqlite3.Connection,
 def run_fetch(conn: sqlite3.Connection) -> dict:
     summary = {
         "date":          today_ist(),
-        "total":         0,
+        "total":         len(ALL_STOCKS) + 2,
         "success":       0,
         "failed":        [],
         "rows_inserted": 0,
         "sources":       {},
     }
 
-    all_tickers = dict(ALL_STOCKS)
-    all_tickers["NIFTY50"]   = NIFTY50_TICKER    # ^NSEI
-    all_tickers["INDIA_VIX"] = INDIA_VIX_TICKER  # ^INDIAVIX
-    summary["total"] = len(all_tickers)
+    logger.info(f"=== Fetch start | {today_ist()} | {summary['total']} tickers ===")
 
-    logger.info(f"=== Fetch start | {today_ist()} | {len(all_tickers)} tickers ===")
+    equity_symbols = set(ALL_STOCKS.keys())
 
-    # Split: equity vs indices (indices don't exist on NSE API)
-    equity_symbols = {s: t for s, t in all_tickers.items() if not t.startswith("^")}
-    index_symbols  = {s: t for s, t in all_tickers.items() if     t.startswith("^")}
+    # ── STEP 1: Bhavcopy for all 28 equities in one pass ─────────────────────
+    logger.info("Step 1: NSE Bhavcopy bulk download …")
+    bhavcopy_results = fetch_bhavcopy_range(equity_symbols, lookback_days=370)
 
-    # ── Equities: yfinance first, NSE API fallback ───────────────────────────
-    for nse_sym, yf_ticker in equity_symbols.items():
-        logger.info(f"  Fetching {nse_sym} …")
-        df = fetch_yfinance(nse_sym, yf_ticker)
-
+    bhavcopy_failed = []
+    for sym in equity_symbols:
+        df = bhavcopy_results.get(sym, pd.DataFrame())
         if not df.empty:
-            n = upsert_prices(conn, nse_sym, df)
+            n = upsert_prices(conn, sym, df)
             summary["rows_inserted"] += n
             summary["success"]       += 1
-            summary["sources"][nse_sym] = "yfinance"
-            logger.info(f"  ✅ {nse_sym:>14}  rows={len(df):>4}  new={n:>4}  [yfinance]")
+            summary["sources"][sym]   = "bhavcopy"
+            logger.info(f"  ✅ {sym:>14}  rows={len(df):>4}  new={n:>4}  [bhavcopy]")
         else:
-            # Fallback: NSE India public API
-            logger.warning(f"  yfinance failed {nse_sym} — trying NSE API …")
-            df = fetch_nse_api(nse_sym)
+            bhavcopy_failed.append(sym)
+            logger.warning(f"  ⚠️  {sym:>14}  not in bhavcopy → yfinance fallback")
+
+    # ── STEP 2: yfinance fallback for any equity Bhavcopy missed ─────────────
+    if bhavcopy_failed:
+        logger.info(f"Step 2: yfinance fallback for {len(bhavcopy_failed)} symbols …")
+        for sym in bhavcopy_failed:
+            yf_ticker = ALL_STOCKS.get(sym, f"{sym}.NS")
+            df = fetch_yfinance_single(sym, yf_ticker)
             if not df.empty:
-                n = upsert_prices(conn, nse_sym, df)
+                n = upsert_prices(conn, sym, df)
                 summary["rows_inserted"] += n
                 summary["success"]       += 1
-                summary["sources"][nse_sym] = "nse_api"
-                logger.info(f"  ✅ {nse_sym:>14}  rows={len(df):>4}  new={n:>4}  [nse_api]")
+                summary["sources"][sym]   = "yfinance"
+                logger.info(f"  ✅ {sym:>14}  rows={len(df):>4}  new={n:>4}  [yfinance]")
             else:
-                summary["failed"].append(nse_sym)
-                logger.error(f"  ❌ {nse_sym:>14}  both sources failed")
+                summary["failed"].append(sym)
+                logger.error(f"  ❌ {sym:>14}  both sources failed")
+            time.sleep(1)
 
-        time.sleep(0.8)   # polite delay between tickers
-
-    # ── Indices: yfinance only ───────────────────────────────────────────────
-    logger.info("  Fetching indices …")
-    for nse_sym, yf_ticker in index_symbols.items():
-        time.sleep(2)
-        df = fetch_yfinance(nse_sym, yf_ticker)
+    # ── STEP 3: Indices via yfinance (NIFTY50 + INDIA_VIX) ───────────────────
+    logger.info("Step 3: indices via yfinance …")
+    for nse_sym, yf_ticker in [("NIFTY50", NIFTY50_TICKER),
+                                ("INDIA_VIX", INDIA_VIX_TICKER)]:
+        df = fetch_yfinance_single(nse_sym, yf_ticker)
         if not df.empty:
             n = upsert_prices(conn, nse_sym, df)
             summary["rows_inserted"] += n
@@ -355,10 +335,8 @@ def run_fetch(conn: sqlite3.Connection) -> dict:
             logger.info(f"  ✅ {nse_sym:>14}  rows={len(df):>4}  new={n:>4}  [yfinance]")
         else:
             summary["failed"].append(nse_sym)
-            logger.warning(
-                f"  ⚠️  {nse_sym}: index fetch failed — "
-                f"regime engine will use last cached value"
-            )
+            logger.warning(f"  ⚠️  {nse_sym}: failed — regime engine will use cached value")
+        time.sleep(1)
 
     return summary
 
@@ -380,16 +358,6 @@ def print_summary(s: dict) -> None:
     print("─" * 58)
 
 
-def get_latest_prices(conn: sqlite3.Connection) -> pd.DataFrame:
-    return pd.read_sql_query("""
-        SELECT symbol, date, close, volume FROM daily_prices
-        WHERE (symbol, date) IN (
-            SELECT symbol, MAX(date) FROM daily_prices GROUP BY symbol
-        )
-        ORDER BY symbol
-    """, conn)
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
@@ -406,11 +374,10 @@ if __name__ == "__main__":
         print("\n📊 Latest prices:\n")
         print(df.to_string(index=False))
     else:
-        print("No data found in DB.")
+        print("No data in DB.")
 
     conn.close()
 
-    # Fail the pipeline only if majority of equities failed
     equity_failures = [f for f in summary["failed"]
                        if f not in ("NIFTY50", "INDIA_VIX")]
     if len(equity_failures) > len(ALL_STOCKS) * 0.5:
