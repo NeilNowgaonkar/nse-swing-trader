@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+venv/
+
+# Environment variables
+.env
+
+# Database
+data/trades.db
+
+# Logs
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
