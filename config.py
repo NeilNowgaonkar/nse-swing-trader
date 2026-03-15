@@ -27,7 +27,7 @@ LARGE_CAP = {
 }
 
 MOMENTUM = {
-    "MM": "M&M.NS",
+    "MM":         "M&M.NS",          # Mahindra & Mahindra (replaces TATAMOTORS)
     "BAJFINANCE": "BAJFINANCE.NS",
     "ADANIPORTS": "ADANIPORTS.NS",
     "SUNPHARMA":  "SUNPHARMA.NS",
@@ -78,7 +78,7 @@ INDIA_VIX_TICKER = "^INDIAVIX"
 # ─────────────────────────────────────────
 # CAPITAL & RISK SETTINGS
 # ─────────────────────────────────────────
-STARTING_CAPITAL      = 5000       # INR
+STARTING_CAPITAL      = 50_000       # INR
 RISK_PER_TRADE_PCT    = 1.5          # % of capital risked per trade
 MAX_OPEN_TRADES       = 4            # hard cap on simultaneous positions
 DAILY_LOSS_LIMIT_PCT  = 2.5          # % — triggers no-new-trades for the day
