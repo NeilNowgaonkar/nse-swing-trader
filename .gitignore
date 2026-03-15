@@ -1,19 +1,79 @@
-# Python
+# ─────────────────────────────────────────────────────────────
+# NSE Swing Trader — .gitignore
+# ─────────────────────────────────────────────────────────────
+
+# ── Python ────────────────────────────────────────────────────
 __pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
 *.pyc
 
-# Virtual environment
+# ── Virtual environments ───────────────────────────────────────
 venv/
+env/
+.env/
+.venv/
+ENV/
 
-# Environment variables
+# ── Environment variables (contains Telegram secrets!) ─────────
 .env
+.env.local
+.env.*.local
+*.env
 
-# Database
+# ── Database (contains your trade history + personal data) ─────
 data/trades.db
+data/*.db
+data/*.db-shm
+data/*.db-wal
 
-# Logs
+# Keep the data folder itself in git
+!data/.gitkeep
+
+# ── Logs (runtime output — not needed in repo) ─────────────────
 logs/
+!logs/.gitkeep
 
-# OS
+# ── OS junk ───────────────────────────────────────────────────
 .DS_Store
+.DS_Store?
+._*
 Thumbs.db
+desktop.ini
+
+# ── IDE / Editor ──────────────────────────────────────────────
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+
+# ── Jupyter (if you ever experiment in notebooks) ─────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Build / dist ──────────────────────────────────────────────
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ── Test artifacts ─────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ── Stray pip file (accidentally committed earlier) ────────────
+pip
+
+# ── Phase 4: Streamlit cache ───────────────────────────────────
+.streamlit/secrets.toml
+
+# ── Any CSV/Excel exports ──────────────────────────────────────
+*.csv
+*.xlsx
+exports/
