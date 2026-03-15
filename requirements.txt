@@ -4,18 +4,16 @@
 pandas==2.2.3
 numpy==1.26.4
 requests==2.32.3
-yfinance==0.2.51
-pandas-datareader==0.10.0
+yfinance==0.2.61
 
-# Database — sqlite3 is built into Python, no install needed
-
+# Database — sqlite3 is built into Python
 # Environment
 python-dotenv==1.0.1
 pytz==2024.1
 
 # Telegram bot
 python-telegram-bot==20.8
-httpx==0.27.0
+httpx==0.26.0
 
 # Dashboard
 streamlit==1.35.0
