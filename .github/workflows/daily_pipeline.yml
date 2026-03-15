@@ -1,33 +1,36 @@
 # .github/workflows/daily_pipeline.yml
 # NSE Swing Trader — Full Pipeline
-# 08:00 IST Mon–Fri (02:30 UTC). Free tier.
 #
-# SAFE TO BE PUBLIC — no secrets in this file.
-# Secrets live in: repo Settings → Secrets → Actions
+# THREE scheduled runs:
+#   1. 09:15 AM IST (03:45 UTC) Mon–Fri — morning alert using yesterday's close
+#   2. 06:30 PM IST (13:00 UTC) Mon–Fri — evening scoring using today's close
+#   3. 10:00 AM IST (04:30 UTC) Saturday — weekend accuracy review
 #
-# Required secrets (add once, never changes):
-#   TELEGRAM_BOT_TOKEN
-#   TELEGRAM_CHAT_ID
+# Why two daily runs:
+#   Morning run  → Bhavcopy has yesterday's close. Alerts you before market opens.
+#   Evening run  → Bhavcopy published ~5:30 PM with TODAY's actual close.
+#                  Scores are more accurate. Gives you signals for tomorrow.
+#   They do NOT have the same data. Evening run is strictly more accurate.
 
 name: NSE Daily Pipeline
 
 on:
   schedule:
-    - cron: "30 2 * * 1-5"   # 02:30 UTC = 08:00 IST, Mon–Fri
-  workflow_dispatch:           # manual "Run workflow" button for testing
+    - cron: "45 3 * * 1-5"    # 09:15 AM IST Mon–Fri (morning alert)
+    - cron: "0 13 * * 1-5"    # 06:30 PM IST Mon–Fri (evening scoring)
+    - cron: "30 4 * * 6"      # 10:00 AM IST Saturday (weekend review)
+  workflow_dispatch:
 
 env:
-  # Opt into Node.js 24 now to silence deprecation warnings
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   run-pipeline:
-    name: Fetch → Regime → Score → Alert
+    name: Fetch → Regime → Score → Analyse → Alert
     runs-on: ubuntu-latest
     timeout-minutes: 25
 
     steps:
-
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -42,13 +45,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Create directories — runners are blank slates, nothing pre-exists
       - name: Create required directories
-        run: |
-          mkdir -p data
-          mkdir -p logs
+        run: mkdir -p data logs
 
-      # Restore trades.db from cache (price data re-fetches, trades cannot)
       - name: Restore database cache
         uses: actions/cache@v4
         with:
@@ -60,7 +59,6 @@ jobs:
       - name: Initialise database
         run: python create_db.py
 
-      # Safety net: restore trades from JSON backup if cache was evicted
       - name: Restore trades from backup
         run: python backup_trades.py --restore
         continue-on-error: true
@@ -83,14 +81,20 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
 
-      - name: Send Telegram alerts
-        run: python telegram_bot.py --send-alerts
+      - name: Run daily analysis with reasoning
+        run: python daily_analysis.py
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
 
-      # Backup trades table to JSON and commit back to repo
-      # This is the safety net against cache eviction
+      # Weekend review — only runs on Saturday trigger
+      - name: Weekend accuracy review
+        if: github.event.schedule == '30 4 * * 6'
+        run: python weekend_review.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+
       - name: Backup trades to JSON
         run: python backup_trades.py --backup
 
@@ -110,12 +114,11 @@ jobs:
           path: data/trades.db
           key: trades-db-${{ runner.os }}-${{ github.run_number }}
 
-      # Upload logs — 'if: always()' ensures this runs even if earlier steps fail
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: pipeline-logs-${{ github.run_number }}
           path: logs/
-          if-no-files-found: ignore   # suppress warning when logs dir is empty
+          if-no-files-found: ignore
           retention-days: 7

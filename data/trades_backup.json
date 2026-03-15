@@ -1,5 +1,28 @@
 {
-  "backup_time": "initial",
-  "row_count": 0,
-  "trades": []
+  "backup_time": "2026-03-15T22:56:56.963194",
+  "row_count": 1,
+  "trades": [
+    {
+      "id": 1,
+      "symbol": "RELIANCE",
+      "bucket": "large_cap",
+      "direction": "LONG",
+      "status": "CLOSED",
+      "entry_price": 1250.5,
+      "entry_date": "2026-03-15",
+      "qty": 10,
+      "stop_loss": 1245.34,
+      "target": 1258.24,
+      "exit_price": 1320.0,
+      "exit_date": "2026-03-15",
+      "pnl": 695.0,
+      "pnl_pct": 5.56,
+      "exit_reason": "TARGET",
+      "score_at_entry": 35.25,
+      "regime_at_entry": "BEAR",
+      "notes": "",
+      "created_at": "2026-03-15 19:26:38",
+      "updated_at": "2026-03-15 19:26:58"
+    }
+  ]
 }

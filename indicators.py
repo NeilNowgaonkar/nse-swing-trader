@@ -188,10 +188,11 @@ def calculate_stop_loss(close: float, atr: float, multiplier: float = 2.0) -> fl
     return round(close - (multiplier * atr), 2)
 
 
-def calculate_target(close: float, atr: float, multiplier: float = 3.0) -> float:
+def calculate_target(close: float, atr: float, multiplier: float = 2.0) -> float:
     """
     ATR-based target above current price.
-    Default: 3× ATR above close → gives 1.5 R:R ratio vs 2× ATR stop.
+    Default: 2× ATR above close → gives 1:1 R:R ratio vs 2× ATR stop.
+    For swing trades this is realistic. 3× ATR often means >1 year to reach.
     """
     if pd.isna(atr) or atr <= 0:
         return round(close * 1.08, 2)   # fallback: 8% above close
