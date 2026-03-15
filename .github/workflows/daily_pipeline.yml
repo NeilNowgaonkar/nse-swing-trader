@@ -1,82 +1,125 @@
 # .github/workflows/daily_pipeline.yml
-# Runs the NSE Swing Trader pipeline every weekday at 08:00 IST (02:30 UTC)
-# Free tier — uses ubuntu-latest runner
-# Secrets required in GitHub repo settings:
-#   TELEGRAM_BOT_TOKEN
-#   TELEGRAM_CHAT_ID
+# NSE Swing Trader — Full Pipeline (Phases 1–3)
+# Runs Mon–Fri at 08:00 IST (02:30 UTC) — Free tier
+#
+# ✅ SAFE TO BE PUBLIC — no secrets in this file.
+#    Tokens are stored in: repo Settings → Secrets → Actions
+#    Referenced here as: ${{ secrets.SECRET_NAME }}
+#
+# Secrets to add in GitHub (Settings → Secrets → Actions):
+#   TELEGRAM_BOT_TOKEN   ← from @BotFather on Telegram
+#   TELEGRAM_CHAT_ID     ← your personal chat ID
 
 name: NSE Daily Pipeline
 
 on:
   schedule:
-    # 02:30 UTC = 08:00 IST (UTC+5:30)
-    # Runs Mon–Fri only
-    - cron: "30 2 * * 1-5"
-
-  # Allow manual trigger from GitHub Actions UI (for testing)
-  workflow_dispatch:
+    - cron: "30 2 * * 1-5"   # 02:30 UTC = 08:00 IST, Mon–Fri only
+  workflow_dispatch:           # ← enables manual "Run workflow" button in Actions UI
 
 jobs:
   run-pipeline:
-    name: Fetch → Score → Alert
+    name: Fetch → Regime → Score → Alert
     runs-on: ubuntu-latest
-    timeout-minutes: 20          # kill if stuck — protects free minutes
+    timeout-minutes: 20        # kills run if stuck — protects free minutes
 
     steps:
-      # ── 1. Checkout code ────────────────────────────────────────────────────
+
+      # ── 1. Checkout your code ────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Set up Python ────────────────────────────────────────────────────
+      # ── 2. Python 3.11 (matches your local version) ──────────────────────────
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
+          cache: "pip"           # caches pip packages between runs — faster installs
 
-      # ── 3. Install dependencies ─────────────────────────────────────────────
+      # ── 3. Install all dependencies ──────────────────────────────────────────
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ── 4. Restore SQLite DB from cache ─────────────────────────────────────
-      # GitHub Actions runners are stateless — we cache the DB between runs
+      # ── 4. Restore trades.db from cache ──────────────────────────────────────
+      # IMPORTANT: GitHub runners are stateless (blank machine every run).
+      # This cache persists trades.db (your portfolio memory) between runs.
+      # Cache survives up to 7 days of inactivity before GitHub evicts it.
+      # Backup step below protects against eviction.
       - name: Restore database cache
         uses: actions/cache@v4
         with:
           path: data/trades.db
-          key: trades-db-${{ runner.os }}
+          key: trades-db-${{ runner.os }}-${{ github.run_number }}
           restore-keys: |
-            trades-db-
+            trades-db-${{ runner.os }}-
 
-      # ── 5. Ensure DB tables exist ────────────────────────────────────────────
+      # ── 5. Create DB tables (safe to run every time — IF NOT EXISTS) ──────────
       - name: Initialise database
         run: python create_db.py
 
-      # ── 6. Fetch OHLCV data ──────────────────────────────────────────────────
+      # ── 6. Restore trades from JSON backup (protects against cache eviction) ──
+      # If trades.db was lost, this restores your trade history from the
+      # trades_backup.json file that is committed to the repo.
+      - name: Restore trades from backup if DB is empty
+        run: python backup_trades.py --restore
+        continue-on-error: true   # don't fail the whole pipeline if backup missing
+
+      # ── 7. Fetch OHLCV for all 28 stocks + Nifty + VIX ──────────────────────
       - name: Fetch market data
         run: python fetch_data.py
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
 
-      # Phase 2 steps will be added here:
-      # - name: Score stocks
-      #   run: python score_stocks.py
-      # - name: Detect regime
-      #   run: python regime_engine.py
-      # - name: Send Telegram alerts
-      #   run: python telegram_bot.py --send-alerts
+      # ── 8. Detect today's market regime ──────────────────────────────────────
+      - name: Detect market regime
+        run: python regime_engine.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
 
-      # ── 7. Save DB back to cache ─────────────────────────────────────────────
+      # ── 9. Score all 28 stocks (6-factor model) ───────────────────────────────
+      - name: Score all stocks
+        run: python score_stocks.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      # ── 10. Send Telegram morning report + BUY alerts ─────────────────────────
+      - name: Send Telegram alerts
+        run: python telegram_bot.py --send-alerts
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      # ── 11. Backup trades table to JSON (committed to repo) ───────────────────
+      # This is your safety net. If the cache is ever evicted, step 6
+      # restores from this file. The JSON only contains your trades — not
+      # the giant price history (which is always re-fetched anyway).
+      - name: Backup trades to JSON
+        run: python backup_trades.py --backup
+
+      # ── 12. Commit the trades backup back to the repo ─────────────────────────
+      - name: Commit trades backup
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/trades_backup.json
+          git diff --staged --quiet || git commit -m "chore: auto-backup trades [skip ci]"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # ← built-in, no setup needed
+
+      # ── 13. Save DB cache for next run ────────────────────────────────────────
       - name: Save database cache
         uses: actions/cache@v4
         with:
           path: data/trades.db
-          key: trades-db-${{ runner.os }}
+          key: trades-db-${{ runner.os }}-${{ github.run_number }}
 
-      # ── 8. Upload logs as artifact ───────────────────────────────────────────
+      # ── 14. Upload logs (always runs, even if earlier steps failed) ───────────
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
